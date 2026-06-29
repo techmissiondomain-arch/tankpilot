@@ -187,9 +187,72 @@
   }
   .note b { color: #aab2c2; font-weight: 600; }
 
+  .badge.reported { color: var(--amber); background: var(--amber-soft); }
+
+  /* ---- station sheet (modal) ---- */
+  .sheet-overlay {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(8, 9, 12, 0.62);
+    display: flex; align-items: flex-end; justify-content: center;
+    padding: 0;
+    animation: fade 0.18s both;
+  }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  .sheet {
+    width: 100%; max-width: 460px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 20px 20px 0 0;
+    padding: 18px 18px calc(20px + env(safe-area-inset-bottom));
+    position: relative;
+    animation: slideup 0.22s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  @keyframes slideup { from { transform: translateY(100%); } to { transform: none; } }
+  .sheet-close {
+    position: absolute; top: 12px; right: 12px;
+    width: 34px; height: 34px; border-radius: 9px;
+    appearance: none; border: 1px solid var(--line); cursor: pointer;
+    background: var(--panel-2); color: var(--muted);
+    font-size: 1.2rem; line-height: 1; font-family: inherit;
+  }
+  .sheet-brand { font-size: 1.18rem; font-weight: 700; letter-spacing: -0.02em; padding-right: 40px; }
+  .sheet-sub { font-size: 0.8rem; color: var(--muted); margin-top: 3px; }
+  .navbig {
+    appearance: none; border: 0; cursor: pointer; width: 100%;
+    margin: 16px 0 6px; font-family: inherit; font-size: 1rem; font-weight: 700;
+    color: #1a1205; background: linear-gradient(180deg, #ffc14d 0%, var(--amber) 100%);
+    padding: 14px; border-radius: 14px;
+  }
+  .prices-h {
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--muted); margin: 16px 0 8px;
+  }
+  .frow { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); }
+  .fname { flex: 1; font-weight: 600; font-size: 0.92rem; display: flex; flex-direction: column; }
+  .fsrc { font-weight: 400; font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+  .fval { font-family: "Space Mono", monospace; font-weight: 700; font-size: 1.02rem; }
+  .reportbtn {
+    appearance: none; cursor: pointer; font-family: inherit;
+    font-size: 0.74rem; font-weight: 600; color: var(--amber);
+    background: var(--amber-soft); border: 1px solid rgba(255, 174, 43, 0.35);
+    padding: 6px 11px; border-radius: 999px;
+  }
+  .reportrow { display: flex; gap: 8px; padding: 4px 0 10px; }
+  .reportrow input {
+    flex: 1; appearance: none; font-family: "Space Mono", monospace; font-size: 0.95rem;
+    color: var(--ink); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .reportrow input:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+  .savebtn {
+    appearance: none; cursor: pointer; font-family: inherit; font-size: 0.85rem; font-weight: 700;
+    color: #1a1205; background: var(--amber); border: 0; padding: 0 16px; border-radius: 10px;
+  }
+  .sheet-note { font-size: 0.7rem; color: var(--muted); line-height: 1.5; margin: 14px 0 0; }
+
   @media (prefers-reduced-motion: reduce) {
     .card, .spinner { animation: none; }
     .find, .card { transition: none; }
+    .sheet-overlay, .sheet { animation: none; }
   }
 </style>
 </head>
@@ -205,7 +268,7 @@
       </div>
       <div>
         <h1>Tankpilot</h1>
-        <p class="tagline">Find the cheapest fill-up near you</p>
+        <p class="tagline">Cheapest fuel near you · Belgium</p>
       </div>
     </header>
 
@@ -235,20 +298,63 @@
     <div class="list" id="list" aria-live="polite"></div>
 
     <p class="note" id="note" hidden>
-      <b>Stations &amp; distances are real</b>, sourced live from
-      <b>OpenStreetMap</b> (© OpenStreetMap contributors) for anywhere in the world.
-      <b>Prices are estimates</b> — there is no single global price feed, so live pump
-      prices need a per-country source (e.g. Germany's Tankerkönig, France's open-data API)
-      or a community "report price" feature. Tap any station to open directions.
+      <b>Stations &amp; distances are real</b>, live from <b>OpenStreetMap</b>
+      (© OpenStreetMap contributors). Prices shown are Belgium's <b>official maximum
+      prices</b> (set daily by FPS Economy) — the legal ceiling; stations may sell below.
+      Tap a station to see prices, get directions, or <b>report the real price</b> you
+      see at the pump (saved on your phone).
     </p>
   </main>
+
+  <div class="sheet-overlay" id="sheetOverlay" hidden>
+    <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-label="Station details"></div>
+  </div>
 
 <script>
 (function () {
   "use strict";
 
-  var state = { fuel: "e95", sort: "dist", stations: [], located: false };
+  var state = { fuel: "e95", sort: "dist", stations: [], located: false,
+                reports: loadReports(), sheetStation: null };
   var $ = function (id) { return document.getElementById(id); };
+
+  // -- Belgium: official maximum prices (FPS Economy). Update these few
+  //    numbers + the date to refresh the legal-ceiling reference. --
+  var BE_OFFICIAL = {
+    date: "2026-06-30",
+    e95: 1.806,   // Euro 95 (E10)
+    e98: 1.887,   // Super 98 (E5)
+    diesel: 1.921 // Diesel (B7)
+  };
+  var FUEL_LABEL = { e95: "Petrol 95", e98: "Petrol 98", diesel: "Diesel" };
+  var BRUSSELS = { lat: 50.8503, lng: 4.3517 };
+  function inBelgium(lat, lng) {
+    return lat > 49.49 && lat < 51.51 && lng > 2.54 && lng < 6.41;
+  }
+
+  // -- community price reports, persisted on this device --
+  var REPORTS_KEY = "tankpilot.reports.v1";
+  function loadReports() {
+    try { return JSON.parse(localStorage.getItem(REPORTS_KEY)) || {}; }
+    catch (e) { return {}; }
+  }
+  function saveReports(r) {
+    try { localStorage.setItem(REPORTS_KEY, JSON.stringify(r)); } catch (e) {}
+  }
+  // price for a station+fuel: a reported price if we have one, else official max.
+  function priceFor(s, fuel) {
+    var byStation = state.reports[s.id];
+    var rep = byStation && byStation[fuel];
+    if (rep && typeof rep.price === "number") return { price: rep.price, reported: true, ts: rep.ts };
+    return { price: BE_OFFICIAL[fuel], reported: false, ts: null };
+  }
+  function ago(ts) {
+    if (!ts) return "";
+    var d = Math.max(0, Date.now() - ts), day = 86400000;
+    if (d < 3600000) return Math.max(1, Math.round(d / 60000)) + "m ago";
+    if (d < day) return Math.round(d / 3600000) + "h ago";
+    return Math.round(d / day) + "d ago";
+  }
 
   // -- fuel selector --
   $("fuel-e95").addEventListener("click", function () { setFuel("e95"); });
@@ -286,22 +392,45 @@
         state.located = true;
         setLoading(false);
         var src = result.live
-          ? " · " + result.stations.length + " real stations (OpenStreetMap)"
-          : " · sample area";
-        setStatus(label + src, label.indexOf("approximate") !== -1 || !result.live);
+          ? " · " + result.stations.length + " stations (OpenStreetMap)"
+          : " · offline · sample stations";
+        setStatus(label + src, label.indexOf("Brussels") !== -1 || !result.live);
         $("sortBar").classList.add("show");
         $("note").hidden = false;
         render();
       });
     };
 
-    if (!navigator.geolocation) {
-      done(LUX.lat, LUX.lng, "Location unavailable \u2014 showing approximate area");
+    // Tankpilot covers Belgium: outside its borders, fall back to Brussels.
+    var onPos = function (lat, lng) {
+      if (inBelgium(lat, lng)) done(lat, lng, "Showing stations near you");
+      else done(BRUSSELS.lat, BRUSSELS.lng, "Outside Belgium \u2014 showing Brussels");
+    };
+
+    getPosition(
+      onPos,
+      function () { done(BRUSSELS.lat, BRUSSELS.lng, "Couldn't read GPS \u2014 showing Brussels"); }
+    );
+  }
+
+  // Get the device location. Works both as a website (navigator.geolocation)
+  // and inside the Capacitor Android app (native Geolocation plugin, which
+  // also triggers the runtime location-permission prompt).
+  function getPosition(onOk, onErr) {
+    var cap = window.Capacitor;
+    if (cap && cap.Plugins && cap.Plugins.Geolocation) {
+      var Geo = cap.Plugins.Geolocation;
+      Geo.requestPermissions().catch(function () {}).then(function () {
+        return Geo.getCurrentPosition({ enableHighAccuracy: true, timeout: 8000 });
+      }).then(function (pos) {
+        onOk(pos.coords.latitude, pos.coords.longitude);
+      }).catch(function () { onErr(); });
       return;
     }
+    if (!navigator.geolocation) { onErr(); return; }
     navigator.geolocation.getCurrentPosition(
-      function (pos) { done(pos.coords.latitude, pos.coords.longitude, "Showing stations near you"); },
-      function () { done(LUX.lat, LUX.lng, "Couldn't read GPS \u2014 showing approximate area"); },
+      function (pos) { onOk(pos.coords.latitude, pos.coords.longitude); },
+      function () { onErr(); },
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
     );
   }
@@ -328,17 +457,23 @@
   }
 
   // ---------------------------------------------------------------
-  // fetchStations(): returns REAL nearby fuel stations worldwide via
+  // fetchStations(): returns REAL nearby fuel stations (Belgium) via
   // the OpenStreetMap Overpass API (amenity=fuel). Distances are real.
-  // Prices are still ESTIMATES — there is no single free global price
-  // feed; wire a per-country feed or a crowd "report price" flow here.
+  // Per-station prices come from priceFor() (a reported price if we
+  // have one, else BE_OFFICIAL max). Fuel availability comes from tags.
   // Returns a Promise<{ stations, live }>. Falls back to sample data
   // if the network/Overpass is unavailable.
   // ---------------------------------------------------------------
-  var LUX = { lat: 49.6116, lng: 6.1319 }; // fallback location: Luxembourg City
   var BRANDS = ["Shell", "Esso", "TotalEnergies", "Aral", "Q8", "Gulf", "BP", "Texaco"];
-  var STREETS = ["Main Road", "Station Street", "Ring Road", "High Street",
-                 "Park Avenue", "Market Street", "Old Mill Road", "Bridge Street"];
+  var STREETS = ["Chaussee de Louvain", "Rue de la Station", "Ring", "Grand-Rue",
+                 "Avenue Louise", "Chaussee de Mons", "Steenweg", "Nieuwstraat"];
+
+  // Which fuels a station sells, from OSM tags. true / false / null(unknown).
+  function tagAvail(t, keys) {
+    var known = false, yes = false;
+    keys.forEach(function (k) { if (k in t) { known = true; if (t[k] === "yes") yes = true; } });
+    return known ? yes : null;
+  }
   // Several Overpass mirrors — tried in order, since any one can be busy.
   var OVERPASS = [
     "https://overpass.kumi.systems/api/interpreter",
@@ -367,20 +502,23 @@
 
     return overpassQuery(q)
       .then(function (data) {
-        var prices = priceModel(lat, lng);
         var out = [];
         (data.elements || []).forEach(function (el) {
           var p = el.type === "node" ? { lat: el.lat, lng: el.lon }
                 : (el.center ? { lat: el.center.lat, lng: el.center.lon } : null);
           if (!p) return;
           var t = el.tags || {};
-          var brand = t.brand || t.name || t.operator || "Fuel station";
-          var street = t["addr:street"] || t["addr:city"] || t["addr:place"] || "";
-          var sp = prices(el.id | 0); // stable per-station estimate
           out.push({
-            brand: brand, street: street, lat: p.lat, lng: p.lng,
+            id: el.type.charAt(0) + el.id,
+            brand: t.brand || t.name || t.operator || "Fuel station",
+            street: t["addr:street"] || t["addr:city"] || t["addr:place"] || "",
+            lat: p.lat, lng: p.lng,
             dist: haversine(lat, lng, p.lat, p.lng),
-            e95: sp.e95, e98: sp.e98, diesel: sp.diesel, estimated: true
+            fuels: {
+              e95: tagAvail(t, ["fuel:octane_95", "fuel:e10"]),
+              e98: tagAvail(t, ["fuel:octane_98", "fuel:e5"]),
+              diesel: tagAvail(t, ["fuel:diesel", "fuel:HGV_diesel"])
+            }
           });
         });
         out.sort(function (a, b) { return a.dist - b.dist; });
@@ -390,36 +528,21 @@
       .catch(function () { return { stations: sampleStations(lat, lng), live: false }; });
   }
 
-  // Estimated price model: a location base + a stable per-station spread.
-  function priceModel(lat, lng) {
-    var base = mulberry32(Math.floor((Math.abs(lat) + Math.abs(lng)) * 1000));
-    var baseE95 = 1.62 + base() * 0.06;
-    var baseE98 = baseE95 + 0.08 + base() * 0.03;
-    var baseDiesel = 1.59 + base() * 0.06;
-    return function (id) {
-      var sr = mulberry32(id || 1);
-      var spreadE = (sr() - 0.5) * 0.10;
-      var spreadD = (sr() - 0.5) * 0.10;
-      return { e95: round2(baseE95 + spreadE), e98: round2(baseE98 + spreadE), diesel: round2(baseDiesel + spreadD) };
-    };
-  }
-
   // Sample stations — used only when Overpass can't be reached.
   function sampleStations(lat, lng) {
     var rng = mulberry32(Math.floor((Math.abs(lat) + Math.abs(lng)) * 1000));
-    var prices = priceModel(lat, lng);
     var out = [];
     for (var i = 0; i < 6; i++) {
       var dKm = 0.4 + rng() * 6.5;
       var ang = rng() * Math.PI * 2;
       var dLat = (dKm / 111) * Math.cos(ang);
       var dLng = (dKm / (111 * Math.cos(lat * Math.PI / 180))) * Math.sin(ang);
-      var sp = prices(Math.floor(rng() * 1e6));
       out.push({
+        id: "sample-" + i,
         brand: BRANDS[Math.floor(rng() * BRANDS.length)],
         street: STREETS[Math.floor(rng() * STREETS.length)],
         lat: lat + dLat, lng: lng + dLng, dist: dKm,
-        e95: sp.e95, e98: sp.e98, diesel: sp.diesel, estimated: true
+        fuels: { e95: true, e98: true, diesel: true }
       });
     }
     out.sort(function (a, b) { return a.dist - b.dist; });
@@ -440,39 +563,55 @@
   function render() {
     var list = $("list");
     var fuel = state.fuel;
-    var items = state.stations.slice();
+    // hide stations that explicitly don't sell the selected fuel (keep unknowns)
+    var items = state.stations.filter(function (s) { return s.fuels[fuel] !== false; });
 
     items.sort(function (a, b) {
-      return state.sort === "price" ? a[fuel] - b[fuel] : a.dist - b.dist;
+      return state.sort === "price" ? priceFor(a, fuel).price - priceFor(b, fuel).price
+                                    : a.dist - b.dist;
     });
 
-    var cheapest = Math.min.apply(null, items.map(function (s) { return s[fuel]; }));
-    $("count").textContent = items.length + " stations";
+    var prices = items.map(function (s) { return priceFor(s, fuel).price; });
+    var cheapest = prices.length ? Math.min.apply(null, prices) : 0;
+    var dearest = prices.length ? Math.max.apply(null, prices) : 0;
+    var hasVariation = dearest - cheapest > 0.0005; // "best" only meaningful once prices differ
+    var hidden = state.stations.length - items.length;
+    $("count").textContent = items.length + (items.length === 1 ? " station" : " stations") +
+      (hidden > 0 ? " \u00b7 " + hidden + " hidden" : "");
 
     list.innerHTML = "";
+    if (!items.length) {
+      list.innerHTML = '<p class="note" style="border:0;padding:0">No nearby stations list ' +
+        FUEL_LABEL[fuel] + '. Try another fuel.</p>';
+      return;
+    }
     items.forEach(function (s, i) {
-      var isBest = s[fuel] === cheapest;
+      var pf = priceFor(s, fuel);
+      var isBest = hasVariation && pf.price === cheapest;
+      var srcTxt = pf.reported ? 'reported ' + ago(pf.ts) : 'official max';
       var card = document.createElement("button");
       card.className = "card" + (isBest ? " best" : "");
       card.style.animationDelay = (i * 0.04) + "s";
       card.setAttribute("aria-label",
-        s.brand + ", " + s.dist.toFixed(1) + " km, " + s[fuel].toFixed(3) + " euro per litre. Open directions.");
+        s.brand + ", " + s.dist.toFixed(1) + " km, " + pf.price.toFixed(3) +
+        " euro per litre, " + srcTxt + ". Open details.");
       card.innerHTML =
         '<span class="rank">' + (i + 1) + '</span>' +
         '<span class="meta">' +
-          '<span class="brand">' + s.brand + '</span>' +
-          '<span class="sub">' + s.street +
+          '<span class="brand">' + esc(s.brand) + '</span>' +
+          '<span class="sub">' + esc(s.street) +
             (isBest ? ' <span class="badge">Best price</span>' : '') +
+            (pf.reported ? ' <span class="badge reported">Reported</span>' : '') +
           '</span>' +
         '</span>' +
         '<span class="price">' +
-          '<span class="num">' + s[fuel].toFixed(3) + '</span>' +
-          '<span class="unit">\u20ac/L \u00b7 ' + (s.estimated ? 'est \u00b7 ' : '') + s.dist.toFixed(1) + ' km</span>' +
-          '<span class="nav">Navigate ' +
+          '<span class="num">' + pf.price.toFixed(3) + '</span>' +
+          '<span class="unit">\u20ac/L \u00b7 ' + srcTxt + ' \u00b7 ' + s.dist.toFixed(1) + ' km</span>' +
+          '<span class="nav">Details ' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="#ffae2b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>' +
           '</span>' +
         '</span>';
-      card.addEventListener("click", function () { navigateTo(s); });
+      card.addEventListener("click", function () { openSheet(s); });
       list.appendChild(card);
     });
   }
@@ -483,7 +622,88 @@
     window.open(url, "_blank", "noopener");
   }
 
+  // -- station detail sheet: prices, report-a-price, navigate --
+  function openSheet(s) {
+    state.sheetStation = s;
+    renderSheet();
+    $("sheetOverlay").hidden = false;
+    document.body.style.overflow = "hidden";
+  }
+  function closeSheet() {
+    $("sheetOverlay").hidden = true;
+    state.sheetStation = null;
+    document.body.style.overflow = "";
+  }
+  function renderSheet() {
+    var s = state.sheetStation; if (!s) return;
+    var rows = ["e95", "e98", "diesel"].map(function (f) {
+      var pf = priceFor(s, f);
+      var srcTxt = pf.reported ? "reported " + ago(pf.ts) : "official max";
+      if (s.fuels[f] === false) srcTxt += " · not sold here";
+      return '' +
+        '<div class="frow">' +
+          '<div class="fname">' + FUEL_LABEL[f] +
+            '<span class="fsrc">' + srcTxt + '</span></div>' +
+          '<div class="fval">' + pf.price.toFixed(3) + '</div>' +
+          '<button class="reportbtn" data-fuel="' + f + '">Report</button>' +
+        '</div>' +
+        '<div class="reportrow" id="rr-' + f + '" hidden>' +
+          '<input type="number" inputmode="decimal" step="0.001" min="0.5" max="3" ' +
+            'placeholder="e.g. 1.799" id="ri-' + f + '" value="' + pf.price.toFixed(3) + '" />' +
+          '<button class="savebtn" data-fuel="' + f + '">Save</button>' +
+        '</div>';
+    }).join("");
+    $("sheet").innerHTML =
+      '<button class="sheet-close" id="sheetClose" aria-label="Close">×</button>' +
+      '<div class="sheet-brand">' + esc(s.brand) + '</div>' +
+      '<div class="sheet-sub">' + (s.street ? esc(s.street) + ' · ' : '') +
+        s.dist.toFixed(1) + ' km away</div>' +
+      '<button class="navbig" id="navBig">Navigate here</button>' +
+      '<div class="prices-h">Prices (€ / L)</div>' +
+      rows +
+      '<p class="sheet-note">Reference = Belgium’s official maximum prices ' +
+        '(FPS Economy), valid ' + BE_OFFICIAL.date + '. Tap “Report” to log the ' +
+        'real price you see — it’s saved on this phone and shown next time.</p>';
+    $("sheetClose").addEventListener("click", closeSheet);
+    $("navBig").addEventListener("click", function () { navigateTo(s); });
+    sheetEach(".reportbtn", function (b) {
+      b.addEventListener("click", function () {
+        var rr = $("rr-" + b.getAttribute("data-fuel"));
+        rr.hidden = !rr.hidden;
+        if (!rr.hidden) $("ri-" + b.getAttribute("data-fuel")).focus();
+      });
+    });
+    sheetEach(".savebtn", function (b) {
+      b.addEventListener("click", function () { saveReport(s, b.getAttribute("data-fuel")); });
+    });
+  }
+  function sheetEach(sel, fn) {
+    var els = $("sheet").querySelectorAll(sel);
+    for (var i = 0; i < els.length; i++) fn(els[i]);
+  }
+  function saveReport(s, fuel) {
+    var input = $("ri-" + fuel);
+    var v = parseFloat(input.value);
+    if (!(v > 0.3 && v < 3.5)) { input.focus(); return; }
+    if (!state.reports[s.id]) state.reports[s.id] = {};
+    state.reports[s.id][fuel] = { price: round2(v), ts: Date.now() };
+    saveReports(state.reports);
+    renderSheet();
+    render();
+  }
+  $("sheetOverlay").addEventListener("click", function (e) {
+    if (e.target === $("sheetOverlay")) closeSheet();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && !$("sheetOverlay").hidden) closeSheet();
+  });
+
   // -- helpers --
+  function esc(str) {
+    return String(str == null ? "" : str).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
   function round2(x) { return Math.round(x * 1000) / 1000; }
   function mulberry32(a) {
     return function () {
@@ -517,7 +737,7 @@
   var manifest = {
     name: "Tankpilot",
     short_name: "Tankpilot",
-    description: "Find the cheapest fill-up near you",
+    description: "Cheapest fuel near you in Belgium",
     start_url: ".",
     display: "standalone",
     background_color: "#14161b",
