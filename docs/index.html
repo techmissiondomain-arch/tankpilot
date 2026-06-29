@@ -197,6 +197,9 @@
     padding: 0;
     animation: fade 0.18s both;
   }
+  /* the hidden attribute must win over display:flex above, or the overlay
+     covers the page and blocks every click */
+  .sheet-overlay[hidden] { display: none; }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
   .sheet {
     width: 100%; max-width: 460px;
