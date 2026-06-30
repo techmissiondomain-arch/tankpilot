@@ -252,6 +252,53 @@
   }
   .sheet-note { font-size: 0.7rem; color: var(--muted); line-height: 1.5; margin: 14px 0 0; }
 
+  /* ---- Smart Fuel Assistant card (Phase 0) ---- */
+  .fuelcard {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px;
+  }
+  .fuel-empty { text-align: center; display: flex; flex-direction: column; gap: 8px; }
+  .fuel-empty-t { font-weight: 700; font-size: 1rem; }
+  .fuel-empty-s { font-size: 0.8rem; color: var(--muted); }
+  .fuel-setup-btn {
+    appearance: none; border: 0; cursor: pointer; margin-top: 4px;
+    font-family: inherit; font-weight: 700; font-size: 0.9rem; color: #1a1205;
+    background: linear-gradient(180deg, #ffc14d 0%, var(--amber) 100%);
+    padding: 11px; border-radius: 12px;
+  }
+  .fuel-top { display: flex; align-items: flex-start; justify-content: space-between; }
+  .fuel-range {
+    font-family: "Space Mono", monospace; font-weight: 700; font-size: 2rem;
+    line-height: 1; color: var(--go); letter-spacing: -0.02em;
+  }
+  .fuel-range span { font-size: 0.9rem; color: var(--muted); }
+  .fuel-range[data-tier="low"] { color: var(--amber); }
+  .fuel-range[data-tier="crit"] { color: #ff5a5a; }
+  .fuel-sub { font-size: 0.76rem; color: var(--muted); margin-top: 5px; }
+  .fuel-edit {
+    appearance: none; border: 1px solid var(--line); cursor: pointer; flex-shrink: 0;
+    background: var(--panel-2); color: var(--muted);
+    width: 34px; height: 34px; border-radius: 9px; font-size: 1rem; font-family: inherit;
+  }
+  .gauge { height: 10px; border-radius: 999px; background: var(--panel-2); overflow: hidden; margin: 14px 0 8px; }
+  .gauge-fill { height: 100%; border-radius: 999px; background: var(--go); transition: width 0.3s; }
+  .gauge-fill[data-tier="low"] { background: var(--amber); }
+  .gauge-fill[data-tier="crit"] { background: #ff5a5a; }
+  .fuel-meta { font-size: 0.78rem; color: var(--muted); font-family: "Space Mono", monospace; }
+  .fuel-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .fuel-btn {
+    flex: 1; appearance: none; cursor: pointer; font-family: inherit; font-weight: 600; font-size: 0.85rem;
+    color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); padding: 11px; border-radius: 11px;
+  }
+  .fuel-btn.primary { color: #1a1205; background: linear-gradient(180deg, #ffc14d 0%, var(--amber) 100%); border: 0; font-weight: 700; }
+  .fuel-note { font-size: 0.7rem; color: var(--muted); line-height: 1.5; margin-top: 10px; }
+  .fld { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; font-size: 0.82rem; color: var(--muted); }
+  .fld input, .fld select {
+    appearance: none; font-family: inherit; font-size: 0.98rem; color: var(--ink);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px;
+  }
+  .fld input:focus-visible, .fld select:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+
   @media (prefers-reduced-motion: reduce) {
     .card, .spinner { animation: none; }
     .find, .card { transition: none; }
@@ -274,6 +321,8 @@
         <p class="tagline">Cheapest fuel near you · Belgium</p>
       </div>
     </header>
+
+    <section class="fuelcard" id="fuelCard"></section>
 
     <div class="seg" role="group" aria-label="Fuel type">
       <button id="fuel-e95" aria-pressed="true">Petrol 95</button>
@@ -311,6 +360,10 @@
 
   <div class="sheet-overlay" id="sheetOverlay" hidden>
     <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-label="Station details"></div>
+  </div>
+
+  <div class="sheet-overlay" id="fuelSheetOverlay" hidden>
+    <div class="sheet" id="fuelSheet" role="dialog" aria-modal="true" aria-label="Fuel setup"></div>
   </div>
 
 <script>
@@ -724,6 +777,181 @@
       return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
   }
+})();
+</script>
+
+<script>
+// ===== Smart Fuel Assistant — Phase 0: vehicle profile + manual fuel gauge =====
+// The domain (provider + estimator) is framework-free and source-agnostic so
+// OBD-II / connected-car providers can be added later WITHOUT touching the
+// estimator or UI. Phase 0 ships the Manual provider only; GPS auto-depletion
+// (distanceSinceFillKm) arrives in Phase 1.
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function num(v) { var n = parseFloat(v); return isFinite(n) ? n : NaN; }
+
+  // ---- persistence ----
+  var VEHICLE_KEY = "tankpilot.vehicle.v1";
+  var FUEL_KEY = "tankpilot.fuel.v1";
+  function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
+  function save(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {} }
+
+  var FUEL_LABEL = { e95: "Petrol 95", e98: "Petrol 98", diesel: "Diesel" };
+  var DEFAULT_CONS = { e95: 6.5, e98: 6.5, diesel: 5.5 }; // L/100km defaults by fuel
+
+  // ---- domain: provider abstraction (the OBD/connected-car seam) ----
+  // Every fuel source implements current() -> { litres, source }.
+  function ManualFuelProvider(vehicle, fuel) { this.id = "manual"; this.vehicle = vehicle; this.fuel = fuel; }
+  ManualFuelProvider.prototype.current = function () {
+    var used = (this.fuel.distanceSinceFillKm / 100) * this.vehicle.avgLper100; // 0 until Phase 1
+    return { litres: clamp(this.fuel.fillLevelL - used, 0, this.vehicle.tankL), source: "manual" };
+  };
+
+  // ---- domain: estimator depends only on the provider interface (SOLID/DIP) ----
+  function FuelEstimator(provider, vehicle) { this.provider = provider; this.vehicle = vehicle; }
+  FuelEstimator.prototype.estimate = function () {
+    var litres = this.provider.current().litres;
+    var rangeKm = (litres / this.vehicle.avgLper100) * 100;
+    return { litres: litres, rangeKm: rangeKm, percent: litres / this.vehicle.tankL, tier: tierFor(rangeKm) };
+  };
+  function tierFor(km) { return km < 25 ? "crit" : km < 50 ? "low" : km < 100 ? "plan" : "ok"; }
+
+  // ---- state ----
+  var state = { vehicle: load(VEHICLE_KEY), fuel: load(FUEL_KEY) };
+  function vehicleReady() { return !!state.vehicle && state.vehicle.tankL > 0 && state.vehicle.avgLper100 > 0; }
+  function ensureFuel() {
+    if (!state.fuel) {
+      state.fuel = { fillLevelL: vehicleReady() ? state.vehicle.tankL : 0, lastFillAt: Date.now(), distanceSinceFillKm: 0 };
+      save(FUEL_KEY, state.fuel);
+    }
+    return state.fuel;
+  }
+
+  // ---- card UI ----
+  function renderCard() {
+    var card = $("fuelCard"); if (!card) return;
+    if (!vehicleReady()) {
+      card.innerHTML =
+        '<div class="fuel-empty">' +
+          '<div class="fuel-empty-t">⛽ Track your fuel &amp; range</div>' +
+          '<div class="fuel-empty-s">Set up your car once to see your estimated range.</div>' +
+          '<button class="fuel-setup-btn" id="fuelSetupBtn">Set up your car</button>' +
+        '</div>';
+      $("fuelSetupBtn").addEventListener("click", openVehicleSheet);
+      return;
+    }
+    ensureFuel();
+    var est = new FuelEstimator(new ManualFuelProvider(state.vehicle, state.fuel), state.vehicle).estimate();
+    var pct = Math.round(est.percent * 100);
+    card.innerHTML =
+      '<div class="fuel-top">' +
+        '<div>' +
+          '<div class="fuel-range" data-tier="' + est.tier + '">≈ ' + Math.round(est.rangeKm) + ' <span>km</span></div>' +
+          '<div class="fuel-sub">est. range · ' + FUEL_LABEL[state.vehicle.fuelType] + '</div>' +
+        '</div>' +
+        '<button class="fuel-edit" id="fuelEditBtn" aria-label="Edit car">⚙</button>' +
+      '</div>' +
+      '<div class="gauge"><div class="gauge-fill" data-tier="' + est.tier + '" style="width:' + clamp(pct, 0, 100) + '%"></div></div>' +
+      '<div class="fuel-meta">~' + est.litres.toFixed(1) + ' L / ' + state.vehicle.tankL + ' L · ' + pct + '%</div>' +
+      '<div class="fuel-actions">' +
+        '<button class="fuel-btn primary" id="fillBtn">I filled up</button>' +
+        '<button class="fuel-btn" id="adjustBtn">Adjust level</button>' +
+      '</div>' +
+      '<div class="fuel-note">Estimate. Automatic GPS tracking comes next — for now, tap “I filled up” after refuelling, or “Adjust level” to match your dashboard.</div>';
+    $("fuelEditBtn").addEventListener("click", openVehicleSheet);
+    $("fillBtn").addEventListener("click", function () { fillUp(); });
+    $("adjustBtn").addEventListener("click", openAdjustSheet);
+  }
+
+  function fillUp() {
+    ensureFuel();
+    state.fuel.fillLevelL = state.vehicle.tankL;
+    state.fuel.lastFillAt = Date.now();
+    state.fuel.distanceSinceFillKm = 0;
+    save(FUEL_KEY, state.fuel);
+    renderCard();
+  }
+
+  // ---- modal sheet (own overlay, independent of the station sheet) ----
+  function openSheet(html) {
+    $("fuelSheet").innerHTML = html;
+    $("fuelSheetOverlay").hidden = false;
+    document.body.style.overflow = "hidden";
+  }
+  function closeSheet() {
+    $("fuelSheetOverlay").hidden = true;
+    document.body.style.overflow = "";
+  }
+
+  function opt(val, sel) { return '<option value="' + val + '"' + (sel === val ? ' selected' : '') + '>' + FUEL_LABEL[val] + '</option>'; }
+
+  function openVehicleSheet() {
+    var v = state.vehicle || { tankL: "", avgLper100: "", fuelType: "e95" };
+    openSheet(
+      '<button class="sheet-close" id="fsClose" aria-label="Close">×</button>' +
+      '<div class="sheet-brand">Your car</div>' +
+      '<div class="sheet-sub">Used only to estimate fuel and range — stays on your phone.</div>' +
+      '<label class="fld"><span>Fuel type</span>' +
+        '<select id="vFuel">' + opt("e95", v.fuelType) + opt("e98", v.fuelType) + opt("diesel", v.fuelType) + '</select></label>' +
+      '<label class="fld"><span>Tank size (litres)</span>' +
+        '<input type="number" inputmode="decimal" id="vTank" min="10" max="200" step="1" placeholder="e.g. 50" value="' + (v.tankL || "") + '"></label>' +
+      '<label class="fld"><span>Average use (litres / 100 km)</span>' +
+        '<input type="number" inputmode="decimal" id="vCons" min="2" max="30" step="0.1" placeholder="e.g. 6.0" value="' + (v.avgLper100 || "") + '"></label>' +
+      '<button class="navbig" id="vSave">Save car</button>' +
+      '<p class="sheet-note">Rough guide: diesel ~5–6, petrol ~6–8 L/100km. You can change this anytime.</p>'
+    );
+    $("fsClose").addEventListener("click", closeSheet);
+    $("vFuel").addEventListener("change", function () {
+      var c = $("vCons"); if (!c.value) c.value = DEFAULT_CONS[$("vFuel").value];
+    });
+    $("vSave").addEventListener("click", saveVehicle);
+  }
+
+  function saveVehicle() {
+    var tank = num($("vTank").value), cons = num($("vCons").value), fuel = $("vFuel").value;
+    if (!(tank >= 10 && tank <= 200)) { $("vTank").focus(); return; }
+    if (!(cons >= 2 && cons <= 30)) { $("vCons").focus(); return; }
+    var firstTime = !vehicleReady();
+    state.vehicle = { tankL: tank, avgLper100: cons, fuelType: fuel };
+    save(VEHICLE_KEY, state.vehicle);
+    if (firstTime || !state.fuel) {
+      state.fuel = { fillLevelL: tank, lastFillAt: Date.now(), distanceSinceFillKm: 0 };
+      save(FUEL_KEY, state.fuel);
+    }
+    closeSheet();
+    renderCard();
+  }
+
+  function openAdjustSheet() {
+    ensureFuel();
+    var cur = new ManualFuelProvider(state.vehicle, state.fuel).current().litres;
+    openSheet(
+      '<button class="sheet-close" id="fsClose" aria-label="Close">×</button>' +
+      '<div class="sheet-brand">Set current fuel</div>' +
+      '<div class="sheet-sub">Enter roughly what your dashboard shows now.</div>' +
+      '<label class="fld"><span>Current fuel (litres, max ' + state.vehicle.tankL + ')</span>' +
+        '<input type="number" inputmode="decimal" id="aL" min="0" max="' + state.vehicle.tankL + '" step="0.5" value="' + cur.toFixed(1) + '"></label>' +
+      '<button class="navbig" id="aSave">Save</button>' +
+      '<button class="fuel-btn primary" id="aFull" style="width:100%;margin-top:8px">Tank is full</button>'
+    );
+    $("fsClose").addEventListener("click", closeSheet);
+    $("aSave").addEventListener("click", function () {
+      var l = num($("aL").value);
+      if (!(l >= 0 && l <= state.vehicle.tankL)) { $("aL").focus(); return; }
+      state.fuel.fillLevelL = l; state.fuel.distanceSinceFillKm = 0; state.fuel.lastFillAt = Date.now();
+      save(FUEL_KEY, state.fuel); closeSheet(); renderCard();
+    });
+    $("aFull").addEventListener("click", function () { fillUp(); closeSheet(); });
+  }
+
+  // overlay click + Escape to close
+  var ov = $("fuelSheetOverlay");
+  ov.addEventListener("click", function (e) { if (e.target === ov) closeSheet(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !ov.hidden) closeSheet(); });
+
+  renderCard();
 })();
 </script>
 
