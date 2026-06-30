@@ -287,6 +287,7 @@
   .fuel-meta { font-size: 0.78rem; color: var(--muted); font-family: "Space Mono", monospace; }
   .fuel-learn { margin-top: 9px; font-size: 0.74rem; font-weight: 600; color: var(--go);
     background: var(--go-soft); border-radius: 10px; padding: 8px 10px; line-height: 1.4; }
+  .sheet-disc { font-size: 0.84rem; color: var(--ink); line-height: 1.5; margin: 12px 0; }
   .fuel-actions { display: flex; gap: 8px; margin-top: 12px; }
   .fuel-btn {
     flex: 1; appearance: none; cursor: pointer; font-family: inherit; font-weight: 600; font-size: 0.85rem;
@@ -396,6 +397,7 @@
       prices</b> (set daily by FPS Economy) — the legal ceiling; stations may sell below.
       Tap a station to see prices, get directions, or <b>report the real price</b> you
       see at the pump (saved on your phone).
+      <a href="privacy.html" rel="noopener" style="color:#aab2c2">Privacy Policy</a>
     </p>
   </main>
 
@@ -918,7 +920,11 @@
     $("fillBtn").addEventListener("click", openFillSheet);
     $("adjustBtn").addEventListener("click", openAdjustSheet);
     var tb = $("tripBtn"); if (tb) tb.addEventListener("click", function () { trip.active ? stopTrip() : startTrip(); });
-    var ab = $("autoBtn"); if (ab) ab.addEventListener("click", function () { auto.on ? stopAuto() : startAuto(); });
+    var ab = $("autoBtn"); if (ab) ab.addEventListener("click", function () {
+      if (auto.on) stopAuto();
+      else if (!hasBgConsent()) openBgConsent();   // Play-required disclosure first
+      else startAuto();
+    });
     state.lastLearn = null; // the "learned" note shows once
   }
 
@@ -1091,6 +1097,24 @@
   function loadAuto() { try { var a = JSON.parse(localStorage.getItem(AUTO_KEY)); auto.on = !!(a && a.on); } catch (e) { auto.on = false; } }
   function saveAuto() { try { localStorage.setItem(AUTO_KEY, JSON.stringify({ on: auto.on })); } catch (e) {} }
 
+  // Google Play requires a prominent disclosure before any background location use.
+  var BG_CONSENT_KEY = "tankpilot.bgconsent.v1";
+  function hasBgConsent() { try { return localStorage.getItem(BG_CONSENT_KEY) === "1"; } catch (e) { return false; } }
+  function setBgConsent() { try { localStorage.setItem(BG_CONSENT_KEY, "1"); } catch (e) {} }
+  function openBgConsent() {
+    openSheet(
+      '<button class="sheet-close" id="fsClose" aria-label="Close">×</button>' +
+      '<div class="sheet-brand">Background location</div>' +
+      '<p class="sheet-disc">Tankpilot collects location data <b>in the background</b> — even when the app is closed or not in use — to automatically detect your trips, keep your fuel range up to date, and alert you to cheaper stations ahead.</p>' +
+      '<p class="sheet-disc">Your location is used <b>only on this device</b> to measure distance and range. It is <b>never uploaded, sold or shared</b>. You can turn this off anytime. See our <a href="privacy.html" target="_blank" rel="noopener" style="color:var(--amber)">Privacy Policy</a>.</p>' +
+      '<button class="navbig" id="bgAccept">Allow background tracking</button>' +
+      '<button class="fuel-btn" id="bgDecline" style="width:100%;margin-top:8px">Not now</button>'
+    );
+    $("fsClose").addEventListener("click", closeSheet);
+    $("bgDecline").addEventListener("click", closeSheet);
+    $("bgAccept").addEventListener("click", function () { setBgConsent(); closeSheet(); startAuto(); });
+  }
+
   function startAuto() {
     var bg = bgPlugin(); if (!bg) return;
     auto.error = null; auto.driving = false; auto.lastLat = null;
@@ -1239,7 +1263,7 @@
     var c = window.Capacitor, LN = c && c.Plugins && c.Plugins.LocalNotifications;
     if (!LN) return;
     LN.requestPermissions().catch(function () {}).then(function () {
-      return LN.schedule({ notifications: [{ id: Date.now() % 100000, title: "Tankpilot — fuel ahead", body: decision.text }] });
+      return LN.schedule({ notifications: [{ id: Date.now() % 100000, title: "Tankpilot — fuel ahead", body: decision.text, smallIcon: "ic_stat_tankpilot", iconColor: "#ffae2b" }] });
     }).catch(function () {});
   }
   (function () { // tap a notification → navigate to the suggested station

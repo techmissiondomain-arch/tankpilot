@@ -1,5 +1,11 @@
 {
   "appId": "be.tankpilot.app",
   "appName": "Tankpilot",
-  "webDir": "docs"
+  "webDir": "docs",
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_tankpilot",
+      "iconColor": "#ffae2b"
+    }
+  }
 }
