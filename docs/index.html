@@ -313,11 +313,33 @@
     100% { box-shadow: 0 0 0 0 rgba(70, 224, 138, 0); }
   }
 
+  /* ---- Phase 3: smart suggestion banner ---- */
+  .abanner { display: none; }
+  .abanner.show {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--amber-soft); border: 1px solid rgba(255, 174, 43, 0.4);
+    border-radius: var(--radius); padding: 13px 14px;
+    animation: rise 0.35s both;
+  }
+  .abanner.tier-crit { background: rgba(255, 90, 90, 0.12); border-color: rgba(255, 90, 90, 0.5); }
+  .abanner-txt { flex: 1; font-size: 0.85rem; font-weight: 600; line-height: 1.35; }
+  .abanner-go {
+    appearance: none; border: 0; cursor: pointer; flex-shrink: 0;
+    font-family: inherit; font-weight: 700; font-size: 0.8rem; color: #1a1205;
+    background: var(--amber); padding: 9px 13px; border-radius: 10px;
+  }
+  .abanner-x {
+    appearance: none; border: 0; cursor: pointer; flex-shrink: 0;
+    background: transparent; color: var(--muted); font-size: 1.2rem; line-height: 1;
+    padding: 2px 4px; font-family: inherit;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .card, .spinner { animation: none; }
     .find, .card { transition: none; }
     .sheet-overlay, .sheet { animation: none; }
     .trip-live .dot { animation: none; }
+    .abanner.show { animation: none; }
   }
 </style>
 </head>
@@ -338,6 +360,8 @@
     </header>
 
     <section class="fuelcard" id="fuelCard"></section>
+
+    <div class="abanner" id="assistantBanner" hidden></div>
 
     <div class="seg" role="group" aria-label="Fuel type">
       <button id="fuel-e95" aria-pressed="true">Petrol 95</button>
@@ -792,6 +816,14 @@
       return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
   }
+
+  // Small read-only API for the Smart Fuel Assistant (Phase 3) — reuses the
+  // robust multi-mirror Overpass fetch + the Belgian price model.
+  window.TankpilotStations = {
+    fetch: fetchStations,                              // (lat,lng) -> Promise<{stations,live}>
+    priceFor: priceFor,                                // (station,fuel) -> {price,reported,ts}
+    officialMax: function (f) { return BE_OFFICIAL[f]; }
+  };
 })();
 </script>
 
@@ -930,6 +962,7 @@
     state.fuel.lastFillAt = Date.now();
     state.fuel.distanceSinceFillKm = 0;
     save(FUEL_KEY, state.fuel);
+    resetAssistant();
     renderCard();
   }
 
@@ -993,6 +1026,7 @@
       var d = haversineKm(trip.lastLat, trip.lastLng, lat, lng);  // km since last fix
       var implied = d / (Math.max(1000, now - trip.lastT) / 3600000); // km/h
       if (d * 1000 >= 8 && implied <= 250) {          // skip GPS jitter & impossible jumps
+        trip.bearing = bearingTo(trip.lastLat, trip.lastLng, lat, lng);
         trip.tripKm += d;
         state.fuel.distanceSinceFillKm += d;
         save(FUEL_KEY, state.fuel);
@@ -1000,6 +1034,7 @@
     }
     trip.lastLat = lat; trip.lastLng = lng; trip.lastT = now;
     trip.lastSpeed = (speed != null && speed >= 0) ? speed * 3.6 : null;
+    runAssistant(lat, lng, trip.bearing);
     renderCard();
   }
 
@@ -1051,17 +1086,124 @@
         var d = haversineKm(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
         var implied = d / (Math.max(1000, now - auto.lastT) / 3600000);
         if (d * 1000 >= 8 && implied <= 250) {
+          auto.bearing = bearingTo(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
           ensureFuel();
           state.fuel.distanceSinceFillKm += d;
           save(FUEL_KEY, state.fuel);
         }
       }
       auto.lastLat = loc.latitude; auto.lastLng = loc.longitude; auto.lastT = now;
+      runAssistant(loc.latitude, loc.longitude, auto.bearing);
     } else {
       auto.lastLat = null; // reset baseline between drives
     }
     renderCard();
   }
+
+  // ===== Phase 3: station-ahead + tiered "notify only when needed" engine =====
+  var CHECK_KM = 3, COOLDOWN_MS = 15 * 60000, REACH_MARGIN_KM = 5, AHEAD_CONE = 75;
+  var TIER_RANK = { ok: 0, plan: 1, low: 2, crit: 3 };
+  var asst = { busy: false, lastCheckLat: null, lastCheckLng: null,
+               notif: { lastTier: null, lastAt: 0, lastStationId: null }, current: null };
+  function resetAssistant() { asst.notif = { lastTier: null, lastAt: 0, lastStationId: null }; hideBanner(); }
+  function escTxt(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+
+  function bearingTo(la1, lo1, la2, lo2) {
+    var t = Math.PI / 180, p1 = la1 * t, p2 = la2 * t, dl = (lo2 - lo1) * t;
+    var y = Math.sin(dl) * Math.cos(p2);
+    var x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+  function angleDiff(a, b) { var d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; }
+
+  // pick the best reachable station ahead — cheapest first, then nearest
+  function stationAhead(lat, lng, bearing, rangeKm, fuel, stations) {
+    var best = null, max = window.TankpilotStations.officialMax(fuel);
+    (stations || []).forEach(function (s) {
+      if (s.fuels && s.fuels[fuel] === false) return;            // doesn't sell this fuel
+      var dKm = (s.dist != null) ? s.dist : haversineKm(lat, lng, s.lat, s.lng);
+      if (dKm < 0.3 || dKm > rangeKm - REACH_MARGIN_KM) return;  // here, or not reachable
+      if (bearing != null && angleDiff(bearing, bearingTo(lat, lng, s.lat, s.lng)) > AHEAD_CONE) return; // not ahead
+      var price = window.TankpilotStations.priceFor(s, fuel).price;
+      var cand = { station: s, distanceKm: dKm, price: price, cheap: price <= max - 0.03 };
+      if (!best || price < best.price - 0.0005 ||
+          (Math.abs(price - best.price) <= 0.0005 && dKm < best.distanceKm)) best = cand;
+    });
+    return best;
+  }
+
+  // tiered decision — returns a notification payload or null ("notify only when needed")
+  function decideNotification(tier, rangeKm, sug, fuel) {
+    if (tier === "ok") return null;                              // comfortable → silent
+    if (!sug) {
+      if (tier === "crit") return { urgency: "crit", suggestion: null,
+        text: "Low fuel: ≈" + Math.round(rangeKm) + " km left and no reachable station found ahead." };
+      return null;
+    }
+    if (tier === "plan" && !sug.cheap) return null;              // mid-range → only for a price deal
+    return { urgency: tier, suggestion: sug,
+      text: "≈" + Math.round(rangeKm) + " km left. " + sug.station.brand + " " +
+            Math.round(sug.distanceKm) + " km ahead: " + FUEL_LABEL[fuel] + " €" + sug.price.toFixed(2) + "/L." };
+  }
+
+  function shouldFire(tier) {
+    if (asst.notif.lastTier == null) return true;
+    if (TIER_RANK[tier] > TIER_RANK[asst.notif.lastTier]) return true; // got worse → always tell
+    return (Date.now() - asst.notif.lastAt) >= COOLDOWN_MS;             // same/better → cooldown
+  }
+
+  function runAssistant(lat, lng, bearing) {
+    if (!vehicleReady() || asst.busy) return;
+    var est = new FuelEstimator(new ManualFuelProvider(state.vehicle, state.fuel), state.vehicle).estimate();
+    if (est.tier === "ok") return;
+    var moved = (asst.lastCheckLat == null) ? Infinity : haversineKm(asst.lastCheckLat, asst.lastCheckLng, lat, lng);
+    var worse = asst.notif.lastTier != null && TIER_RANK[est.tier] > TIER_RANK[asst.notif.lastTier];
+    if (moved < CHECK_KM && !worse) return;                      // throttle network checks
+    var api = window.TankpilotStations; if (!api) return;
+    asst.busy = true; asst.lastCheckLat = lat; asst.lastCheckLng = lng;
+    var fuel = state.vehicle.fuelType;
+    api.fetch(lat, lng).then(function (res) {
+      var sug = stationAhead(lat, lng, bearing, est.rangeKm, fuel, res.stations);
+      var decision = decideNotification(est.tier, est.rangeKm, sug, fuel);
+      if (decision && shouldFire(est.tier)) {
+        asst.notif.lastTier = est.tier; asst.notif.lastAt = Date.now();
+        asst.notif.lastStationId = sug ? sug.station.id : null;
+        asst.current = decision;
+        showBanner(decision);
+        fireNativeNotification(decision);
+      }
+    }).catch(function () {}).then(function () { asst.busy = false; });
+  }
+
+  function showBanner(decision) {
+    var b = $("assistantBanner"); if (!b) return;
+    var go = decision.suggestion ? '<button class="abanner-go" id="abannerGo">Navigate</button>' : "";
+    b.className = "abanner show tier-" + decision.urgency;
+    b.innerHTML = '<div class="abanner-txt">' + escTxt(decision.text) + "</div>" + go +
+      '<button class="abanner-x" id="abannerX" aria-label="Dismiss">×</button>';
+    b.hidden = false;
+    if (decision.suggestion) $("abannerGo").addEventListener("click", function () { navigateToStation(decision.suggestion.station); });
+    $("abannerX").addEventListener("click", hideBanner);
+  }
+  function hideBanner() { var b = $("assistantBanner"); if (b) { b.hidden = true; b.className = "abanner"; } }
+  function navigateToStation(s) {
+    window.open("https://www.google.com/maps/dir/?api=1&destination=" +
+      s.lat.toFixed(6) + "," + s.lng.toFixed(6) + "&travelmode=driving", "_blank", "noopener");
+  }
+
+  function fireNativeNotification(decision) {
+    var c = window.Capacitor, LN = c && c.Plugins && c.Plugins.LocalNotifications;
+    if (!LN) return;
+    LN.requestPermissions().catch(function () {}).then(function () {
+      return LN.schedule({ notifications: [{ id: Date.now() % 100000, title: "Tankpilot — fuel ahead", body: decision.text }] });
+    }).catch(function () {});
+  }
+  (function () { // tap a notification → navigate to the suggested station
+    var c = window.Capacitor, LN = c && c.Plugins && c.Plugins.LocalNotifications;
+    if (LN && LN.addListener) LN.addListener("localNotificationActionPerformed", function () {
+      if (asst.current && asst.current.suggestion) navigateToStation(asst.current.suggestion.station);
+    });
+  })();
 
   // ---- modal sheet (own overlay, independent of the station sheet) ----
   function openSheet(html) {
@@ -1130,7 +1272,7 @@
       var l = num($("aL").value);
       if (!(l >= 0 && l <= state.vehicle.tankL)) { $("aL").focus(); return; }
       state.fuel.fillLevelL = l; state.fuel.distanceSinceFillKm = 0; state.fuel.lastFillAt = Date.now();
-      save(FUEL_KEY, state.fuel); closeSheet(); renderCard();
+      save(FUEL_KEY, state.fuel); resetAssistant(); closeSheet(); renderCard();
     });
     $("aFull").addEventListener("click", function () { fillUp(); closeSheet(); });
   }
