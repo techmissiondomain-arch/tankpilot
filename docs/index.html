@@ -875,18 +875,43 @@
         '<button class="fuel-btn" id="adjustBtn">Adjust level</button>' +
       '</div>' +
       tripRowHtml() +
-      '<div class="fuel-note">' + (trip.active
-        ? 'Live tracking — your range drops as you drive (keep the app open). Phase 2 makes this automatic & background.'
-        : 'Tap “Start trip” to let GPS update your range live as you drive. Or use “I filled up” / “Adjust level” anytime.') +
+      '<div class="fuel-note">' + noteText() +
         (trip.error ? ' <b style="color:var(--amber)">' + trip.error + '</b>' : '') +
+        (auto.error ? ' <b style="color:var(--amber)">' + auto.error + '</b>' : '') +
       '</div>';
     $("fuelEditBtn").addEventListener("click", openVehicleSheet);
     $("fillBtn").addEventListener("click", function () { fillUp(); });
     $("adjustBtn").addEventListener("click", openAdjustSheet);
-    $("tripBtn").addEventListener("click", function () { trip.active ? stopTrip() : startTrip(); });
+    var tb = $("tripBtn"); if (tb) tb.addEventListener("click", function () { trip.active ? stopTrip() : startTrip(); });
+    var ab = $("autoBtn"); if (ab) ab.addEventListener("click", function () { auto.on ? stopAuto() : startAuto(); });
+  }
+
+  function noteText() {
+    if (hasBackground()) {
+      return auto.on
+        ? 'Auto-tracking detects when you drive and updates your range in the background — even with the screen off. A notification shows while it’s active.'
+        : 'Turn on auto-track and Tankpilot detects your drives automatically and keeps your range current in the background.';
+    }
+    return trip.active
+      ? 'Live tracking — your range drops as you drive (keep the app open). The installed Android app does this automatically in the background.'
+      : 'Tap “Start trip” to update your range live as you drive. (Automatic background tracking is in the Android app.)';
   }
 
   function tripRowHtml() {
+    // Native app with the background plugin → Phase 2 automatic tracking
+    if (hasBackground()) {
+      if (auto.on) {
+        var st = auto.driving ? 'Driving — tracking' : 'Auto-track on · waiting for a drive';
+        return '<div class="trip-row">' +
+          '<div class="trip-live"><span class="dot"></span>' + st + '</div>' +
+          '<button class="fuel-btn" id="autoBtn">Turn off</button>' +
+        '</div>';
+      }
+      return '<div class="trip-row">' +
+        '<button class="fuel-btn track" id="autoBtn" style="flex:1">Auto-track trips (background)</button>' +
+      '</div>';
+    }
+    // Web (or app without the plugin) → Phase 1 manual trip
     if (trip.active) {
       var spd = (trip.lastSpeed != null) ? ' · ' + Math.round(trip.lastSpeed) + ' km/h' : '';
       return '<div class="trip-row">' +
@@ -978,6 +1003,66 @@
     renderCard();
   }
 
+  // ---- Phase 2: automatic driving detection + background tracking (native app only) ----
+  var AUTO_KEY = "tankpilot.autotrack.v1";
+  var auto = { on: false, watcherId: null, driving: false, lastMoveT: 0, lastLat: null, lastLng: null, lastT: 0, error: null };
+  function isNative() { var c = window.Capacitor; return !!(c && (typeof c.isNativePlatform === "function" ? c.isNativePlatform() : c.isNative)); }
+  function bgPlugin() { var c = window.Capacitor; return c && c.Plugins && c.Plugins.BackgroundGeolocation; }
+  function hasBackground() { return isNative() && !!bgPlugin(); }
+  function loadAuto() { try { var a = JSON.parse(localStorage.getItem(AUTO_KEY)); auto.on = !!(a && a.on); } catch (e) { auto.on = false; } }
+  function saveAuto() { try { localStorage.setItem(AUTO_KEY, JSON.stringify({ on: auto.on })); } catch (e) {} }
+
+  function startAuto() {
+    var bg = bgPlugin(); if (!bg) return;
+    auto.error = null; auto.driving = false; auto.lastLat = null;
+    auto.on = true; renderCard();
+    bg.addWatcher({
+      backgroundTitle: "Tankpilot",
+      backgroundMessage: "Tracking your trip to keep your range up to date.",
+      requestPermissions: true,
+      stale: false,
+      distanceFilter: 25
+    }, function (location, error) {
+      if (error) {
+        auto.error = (error.code === "NOT_AUTHORIZED")
+          ? "Allow location 'All the time' for background tracking."
+          : "Background GPS error.";
+        renderCard(); return;
+      }
+      onAutoFix(location);
+    }).then(function (id) { auto.watcherId = id; auto.on = true; saveAuto(); renderCard(); })
+      .catch(function () { auto.on = false; auto.error = "Could not start background tracking."; saveAuto(); renderCard(); });
+  }
+  function stopAuto() {
+    var bg = bgPlugin();
+    if (bg && auto.watcherId) { try { bg.removeWatcher({ id: auto.watcherId }); } catch (e) {} }
+    auto.watcherId = null; auto.on = false; auto.driving = false; saveAuto(); renderCard();
+  }
+  // Speed-based driving state machine + distance accumulation (same filters as Phase 1).
+  function onAutoFix(loc) {
+    var spdKmh = (loc.speed != null && loc.speed >= 0) ? loc.speed * 3.6 : null;
+    var now = loc.time || Date.now();
+    if (spdKmh != null) {
+      if (spdKmh >= 18) { auto.driving = true; auto.lastMoveT = now; }
+      else if (spdKmh < 5 && auto.driving && (now - auto.lastMoveT) > 180000) { auto.driving = false; }
+    }
+    if (auto.driving && loc.accuracy != null && loc.accuracy <= 50) {
+      if (auto.lastLat != null) {
+        var d = haversineKm(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
+        var implied = d / (Math.max(1000, now - auto.lastT) / 3600000);
+        if (d * 1000 >= 8 && implied <= 250) {
+          ensureFuel();
+          state.fuel.distanceSinceFillKm += d;
+          save(FUEL_KEY, state.fuel);
+        }
+      }
+      auto.lastLat = loc.latitude; auto.lastLng = loc.longitude; auto.lastT = now;
+    } else {
+      auto.lastLat = null; // reset baseline between drives
+    }
+    renderCard();
+  }
+
   // ---- modal sheet (own overlay, independent of the station sheet) ----
   function openSheet(html) {
     $("fuelSheet").innerHTML = html;
@@ -1054,6 +1139,10 @@
   var ov = $("fuelSheetOverlay");
   ov.addEventListener("click", function (e) { if (e.target === ov) closeSheet(); });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !ov.hidden) closeSheet(); });
+
+  // Resume background auto-tracking if it was on (native app), else clear the flag.
+  loadAuto();
+  if (auto.on && hasBackground()) { startAuto(); } else { auto.on = false; }
 
   renderCard();
 })();
