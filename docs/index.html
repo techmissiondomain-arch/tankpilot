@@ -930,13 +930,28 @@
       else if (!hasBgConsent()) openBgConsent();   // Play-required disclosure first
       else startAuto();
     });
+    var th = $("trackHelp"); if (th) th.addEventListener("click", function (e) { e.preventDefault(); openTrackingHelp(); });
     state.lastLearn = null; // the "learned" note shows once
+  }
+
+  function openTrackingHelp() {
+    openSheet(
+      '<button class="sheet-close" id="fsClose" aria-label="Close">×</button>' +
+      '<div class="sheet-brand">Make tracking reliable</div>' +
+      '<p class="sheet-disc">Android needs a few manual settings for background tracking — it won’t always ask you:</p>' +
+      '<p class="sheet-disc"><b>1. Location → Allow all the time.</b><br>Settings → Apps → Tankpilot → Permissions → Location → <b>Allow all the time</b>.</p>' +
+      '<p class="sheet-disc"><b>2. Turn off battery limits.</b><br>Settings → Apps → Tankpilot → Battery → <b>Unrestricted</b>. On Samsung also: Settings → Battery → Background usage limits → remove Tankpilot from “Sleeping apps”.</p>' +
+      '<p class="sheet-disc"><b>3. Allow notifications</b> when asked, so the trip and low-fuel alerts appear.</p>' +
+      '<button class="navbig" id="thClose">Got it</button>'
+    );
+    $("fsClose").addEventListener("click", closeSheet);
+    $("thClose").addEventListener("click", closeSheet);
   }
 
   function noteText() {
     if (hasBackground()) {
       return auto.on
-        ? 'Auto-tracking detects when you drive and updates your range in the background — even with the screen off. A notification shows while it’s active.'
+        ? 'Auto-tracking detects when you drive and updates your range in the background — even with the screen off. <a href="#" id="trackHelp" style="color:var(--amber)">Not tracking?</a>'
         : 'Turn on auto-track and Tankpilot detects your drives automatically and keeps your range current in the background.';
     }
     return trip.active
@@ -1120,9 +1135,23 @@
     $("bgAccept").addEventListener("click", function () { setBgConsent(); closeSheet(); startAuto(); });
   }
 
+  var STOP_MS = 180000; // 3 min with no movement => parked
+  function setDriving(v) { if (auto.driving !== v) { auto.driving = v; renderCard(); } }
+  // Watchdog: phones stop sending GPS fixes when stationary, so the speed check
+  // alone can leave us stuck on "driving". If no movement arrives for STOP_MS,
+  // declare "parked" on a timer instead.
+  function armParkTimer() {
+    if (auto.parkTimer) clearTimeout(auto.parkTimer);
+    auto.parkTimer = setTimeout(function () { setDriving(false); }, STOP_MS);
+  }
+  function clearParkTimer() { if (auto.parkTimer) { clearTimeout(auto.parkTimer); auto.parkTimer = null; } }
+
   function startAuto() {
     var bg = bgPlugin(); if (!bg) return;
-    auto.error = null; auto.driving = false; auto.lastLat = null;
+    // Android 13+: request notification permission so the tracking + alert notifications show.
+    var LN = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.LocalNotifications;
+    if (LN) LN.requestPermissions().catch(function () {});
+    auto.error = null; auto.driving = false; auto.lastLat = null; auto.lastMoveT = 0;
     auto.on = true; renderCard();
     bg.addWatcher({
       backgroundTitle: "Tankpilot",
@@ -1142,34 +1171,39 @@
       .catch(function () { auto.on = false; auto.error = "Could not start background tracking."; saveAuto(); renderCard(); });
   }
   function stopAuto() {
+    clearParkTimer();
     var bg = bgPlugin();
     if (bg && auto.watcherId) { try { bg.removeWatcher({ id: auto.watcherId }); } catch (e) {} }
     auto.watcherId = null; auto.on = false; auto.driving = false; saveAuto(); renderCard();
   }
-  // Speed-based driving state machine + distance accumulation (same filters as Phase 1).
+  // Driving state machine + distance accumulation, with the park watchdog.
   function onAutoFix(loc) {
     var spdKmh = (loc.speed != null && loc.speed >= 0) ? loc.speed * 3.6 : null;
     var now = loc.time || Date.now();
-    if (spdKmh != null) {
-      if (spdKmh >= 18) { auto.driving = true; auto.lastMoveT = now; }
-      else if (spdKmh < 5 && auto.driving && (now - auto.lastMoveT) > 180000) { auto.driving = false; }
-    }
-    if (auto.driving && loc.accuracy != null && loc.accuracy <= 50) {
-      if (auto.lastLat != null) {
-        var d = haversineKm(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
-        var implied = d / (Math.max(1000, now - auto.lastT) / 3600000);
-        if (d * 1000 >= 8 && implied <= 250) {
-          auto.bearing = bearingTo(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
-          ensureFuel();
-          state.fuel.distanceSinceFillKm += d;
-          save(FUEL_KEY, state.fuel);
-        }
+    var goodFix = loc.accuracy != null && loc.accuracy <= 50;
+
+    // Movement = clearly-fast speed OR a real distance step from the last fix.
+    var moved = (spdKmh != null && spdKmh >= 18);
+    var dCounted = 0;
+    if (goodFix && auto.lastLat != null) {
+      var d = haversineKm(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
+      var implied = d / (Math.max(1000, now - auto.lastT) / 3600000);
+      if (d * 1000 >= 8 && implied <= 250) {
+        dCounted = d; moved = true;
+        auto.bearing = bearingTo(auto.lastLat, auto.lastLng, loc.latitude, loc.longitude);
       }
-      auto.lastLat = loc.latitude; auto.lastLng = loc.longitude; auto.lastT = now;
-      runAssistant(loc.latitude, loc.longitude, auto.bearing);
-    } else {
-      auto.lastLat = null; // reset baseline between drives
     }
+
+    if (moved) { auto.lastMoveT = now; setDriving(true); armParkTimer(); }
+    else if (spdKmh != null && spdKmh < 5 && auto.driving && (now - auto.lastMoveT) > STOP_MS) { setDriving(false); }
+
+    if (auto.driving && dCounted > 0) {
+      ensureFuel();
+      state.fuel.distanceSinceFillKm += dCounted;
+      save(FUEL_KEY, state.fuel);
+    }
+    if (goodFix) { auto.lastLat = loc.latitude; auto.lastLng = loc.longitude; auto.lastT = now; }
+    if (auto.driving) runAssistant(loc.latitude, loc.longitude, auto.bearing);
     renderCard();
   }
 
