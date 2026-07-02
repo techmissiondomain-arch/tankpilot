@@ -158,11 +158,14 @@
   }
   .card.best .rank { background: var(--go-soft); color: var(--go); }
 
-  .meta { min-width: 0; }
-  .brand { font-weight: 600; font-size: 0.98rem; letter-spacing: -0.01em;
+  .meta { min-width: 0; display: flex; flex-direction: column; }
+  .brand { display: block; font-weight: 600; font-size: 0.98rem; letter-spacing: -0.01em;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sub { font-size: 0.76rem; color: var(--muted); margin-top: 2px;
-    display: flex; align-items: center; gap: 7px; }
+    display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .sub .street { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .sub .badge { flex-shrink: 0; }
+  .price { max-width: 45%; }
   .badge {
     font-size: 0.62rem; font-weight: 700; letter-spacing: 0.04em;
     color: var(--go); background: var(--go-soft);
@@ -692,12 +695,13 @@
         FUEL_LABEL[fuel] + '. Try another fuel.</p>';
       return;
     }
+    var topLabel = (state.sort === "price" && hasVariation) ? "Cheapest" : "Nearest";
     items.forEach(function (s, i) {
       var pf = priceFor(s, fuel);
-      var isBest = hasVariation && pf.price === cheapest;
+      var isTop = i === 0;                          // green-highlight the #1 pick for the current sort
       var srcTxt = pf.reported ? 'reported ' + ago(pf.ts) : 'official max';
       var card = document.createElement("button");
-      card.className = "card" + (isBest ? " best" : "");
+      card.className = "card" + (isTop ? " best" : "");
       card.style.animationDelay = (i * 0.04) + "s";
       card.setAttribute("aria-label",
         s.brand + ", " + s.dist.toFixed(1) + " km, " + pf.price.toFixed(3) +
@@ -706,14 +710,15 @@
         '<span class="rank">' + (i + 1) + '</span>' +
         '<span class="meta">' +
           '<span class="brand">' + esc(s.brand) + '</span>' +
-          '<span class="sub">' + esc(s.street) +
-            (isBest ? ' <span class="badge">Best price</span>' : '') +
+          '<span class="sub">' +
+            '<span class="street">' + esc(s.street || "Fuel station") + '</span>' +
+            (isTop ? ' <span class="badge">' + topLabel + '</span>' : '') +
             (pf.reported ? ' <span class="badge reported">Reported</span>' : '') +
           '</span>' +
         '</span>' +
         '<span class="price">' +
           '<span class="num">' + pf.price.toFixed(3) + '</span>' +
-          '<span class="unit">\u20ac/L \u00b7 ' + srcTxt + ' \u00b7 ' + s.dist.toFixed(1) + ' km</span>' +
+          '<span class="unit">\u20ac/L \u00b7 ' + s.dist.toFixed(1) + ' km</span>' +
           '<span class="nav">Details ' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="#ffae2b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>' +
           '</span>' +
